@@ -53,11 +53,40 @@ ROUTE_DEFINITIONS = {
         "direction": "IDA",
         "jsonld_key": "itinerary",
         "page": f"{SITE}/horario/0.167",
+        # O JSON-LD da página resume o itinerário nas primeiras 20 paradas,
+        # embora a OAB/Galois seja a parada 30 no trajeto completo.
+        "target_position": 30,
+        "target_name": (
+            "Via L2 Sul - SAUS, Quadra 5 "
+            "(Edifício Sede OAB / GALOIS)"
+        ),
+        "target_lat": -15.79733,
+        "target_lon": -47.87610,
+        "fallback_anchors": [
+            (-15.7868, -47.8767),
+            (-15.79733, -47.87610),
+        ],
     },
     "167.1": {
         "direction": "VOLTA",
         "jsonld_key": "returnTrip",
         "page": f"{SITE}/horario/167.1",
+        # No sentido Asa Norte -> Guará, a parada fica depois do trecho
+        # da Esplanada. A posição é aproximada porque os sentidos têm
+        # quantidades de paradas ligeiramente diferentes.
+        "target_position": 34,
+        "target_name": (
+            "Via L2 Sul - SGAS 601 "
+            "(Galois / Edifício Sede OAB)"
+        ),
+        "target_lat": -15.79733,
+        "target_lon": -47.87610,
+        "fallback_anchors": [
+            (-15.7855, -47.8755),
+            (-15.7995, -47.8605),
+            (-15.7960, -47.8690),
+            (-15.79733, -47.87610),
+        ],
     },
 }
 
@@ -316,6 +345,110 @@ def parse_trip_stops(trip: dict[str, Any]) -> tuple[
     return points, names
 
 
+
+def interpolate_fallback_path(
+    start: tuple[float, float],
+    anchors: list[tuple[float, float]],
+    count: int,
+) -> list[tuple[float, float]]:
+    """
+    Gera pontos intermediários ao longo de um caminho aproximado.
+
+    O site publica o itinerário completo na página, mas o JSON-LD usado
+    para obter coordenadas pode trazer somente as primeiras 20 paradas.
+    Esta função completa o trecho restante até a OAB/Galois.
+    """
+    if count <= 0:
+        return []
+
+    path = [start, *anchors]
+    segment_lengths = [
+        haversine_m(
+            path[index][0],
+            path[index][1],
+            path[index + 1][0],
+            path[index + 1][1],
+        )
+        for index in range(len(path) - 1)
+    ]
+    total = sum(segment_lengths)
+
+    if total <= 0:
+        return [anchors[-1]] * count
+
+    result: list[tuple[float, float]] = []
+
+    for step in range(1, count + 1):
+        desired = total * step / count
+        accumulated = 0.0
+
+        for index, segment_length in enumerate(segment_lengths):
+            if desired <= accumulated + segment_length or index == len(segment_lengths) - 1:
+                fraction = (
+                    0.0
+                    if segment_length <= 0
+                    else (desired - accumulated) / segment_length
+                )
+                fraction = max(0.0, min(1.0, fraction))
+
+                lat1, lon1 = path[index]
+                lat2, lon2 = path[index + 1]
+                result.append(
+                    (
+                        lat1 + (lat2 - lat1) * fraction,
+                        lon1 + (lon2 - lon1) * fraction,
+                    )
+                )
+                break
+
+            accumulated += segment_length
+
+    # Garante que o último ponto seja exatamente a parada configurada.
+    result[-1] = anchors[-1]
+    return result
+
+
+def add_target_fallback(
+    line: str,
+    definition: dict[str, Any],
+    points: list[tuple[float, float]],
+    names: list[str],
+) -> tuple[list[tuple[float, float]], list[str], int]:
+    target_position = int(definition["target_position"])
+    target_name = str(definition["target_name"])
+    target = (
+        float(definition["target_lat"]),
+        float(definition["target_lon"]),
+    )
+
+    missing = max(1, target_position - len(points))
+    anchors = [
+        (float(lat), float(lon))
+        for lat, lon in definition.get("fallback_anchors", [target])
+    ]
+
+    if not anchors or anchors[-1] != target:
+        anchors.append(target)
+
+    generated = interpolate_fallback_path(points[-1], anchors, missing)
+
+    for index, point in enumerate(generated, start=1):
+        points.append(point)
+        if index == len(generated):
+            names.append(target_name)
+        else:
+            names.append(
+                f"Trecho intermediário aproximado {len(names) + 1}"
+            )
+
+    stop_index = len(points) - 1
+    print(
+        f"[itinerário] a página resumiu as coordenadas da linha {line}; "
+        f"foi aplicado o ponto fixo da OAB/Galois na posição "
+        f"{stop_index + 1}."
+    )
+    return points, names, stop_index
+
 def load_route(
     line: str,
     definition: dict[str, str],
@@ -349,7 +482,6 @@ def load_route(
         )
 
     points, names = parse_trip_stops(trip)
-    cumulative = cumulative_distances(points)
 
     stop_candidates = [
         index
@@ -357,12 +489,17 @@ def load_route(
         if any(keyword in name.lower() for keyword in config.stop_keywords)
     ]
 
-    if not stop_candidates:
-        raise RuntimeError(
-            f"Não encontrei a parada OAB/Galois no itinerário da linha {line}."
+    if stop_candidates:
+        stop_index = stop_candidates[0]
+    else:
+        points, names, stop_index = add_target_fallback(
+            line,
+            definition,
+            points,
+            names,
         )
 
-    stop_index = stop_candidates[0]
+    cumulative = cumulative_distances(points)
 
     route = Route(
         line=line,
