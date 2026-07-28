@@ -1,618 +1,486 @@
 #!/usr/bin/env python3
 """
-Monitor de ônibus do DF com alertas pelo Telegram.
+Monitor definitivo das linhas 0.167 e 167.1.
 
-Linhas padrão: 167 (também aceita 0.167) e 167.1
-Parada: L2 Sul | SAUS (OAB / Colégio Galois)
-Alertas: aproximadamente 30 e 15 minutos antes.
+Parada: Via L2 Sul / SAUS, Quadra 5 — OAB / Galois
+Sentido: Plano Piloto -> Guará
+Alertas: aproximadamente 30 e 15 minutos antes
+Fonte: serviço em tempo real utilizado pelo dfnoponto.com
 
-A estimativa é experimental: usa a posição dos veículos, o itinerário publicado
-pela Semob, a velocidade observada e um fator de trânsito configurável.
+O programa:
+- lê os itinerários publicados nas páginas das linhas;
+- localiza a parada OAB/Galois;
+- conecta ao Socket.IO por HTTP polling;
+- recebe as posições dos ônibus;
+- projeta cada veículo no itinerário correto;
+- estima o tempo restante;
+- envia os alertas para todos os chat_ids do Telegram.
 """
 
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import math
 import os
 import re
 import sys
 import time
-import unicodedata
-from dataclasses import dataclass
-from datetime import datetime, time as dt_time
+from dataclasses import dataclass, field
+from datetime import datetime, time as clock_time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 
-WFS_URL = "https://geoserver.semob.df.gov.br/geoserver/semob/ows"
+SITE = "https://dfnoponto.com"
+SOCKET_SERVER = "https://nopontoserver.onrender.com"
+SOCKET_PATH = f"{SOCKET_SERVER}/socket.io/"
+SOCKET_ORIGIN = SITE
+RECORD_SEPARATOR = "\x1e"
 
-POSITION_LAYER = "semob:ultima_posicao"
-STOP_LAYER = "semob:ponto_parada_v2025"
-ROUTE_LAYER = "semob:itinerario_espacial"
-
-REQUEST_CONNECT_TIMEOUT = 15
-REQUEST_READ_TIMEOUT = 90
 EARTH_RADIUS_M = 6_371_000.0
+CONNECT_TIMEOUT = 30
+READ_TIMEOUT = 90
 
-
-def build_http_session() -> requests.Session:
-    retry = Retry(
-        total=4,
-        connect=4,
-        read=3,
-        status=3,
-        backoff_factor=3,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET", "POST"}),
-        raise_on_status=False,
-    )
-    session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": (
-                "monitor-onibus-df/1.1 "
-                "(consulta de dados publicos da Semob-DF)"
-            ),
-            "Accept": "application/json,text/plain,*/*",
-        }
-    )
-    session.mount("https://", HTTPAdapter(max_retries=retry))
-    session.mount("http://", HTTPAdapter(max_retries=retry))
-    return session
-
-
-HTTP = build_http_session()
-
-LINE_ALIASES = (
-    "linha", "numero_linha", "num_linha", "nr_linha", "codigo_linha",
-    "cod_linha", "linha_numero", "servico", "numero", "codigo",
-)
-VEHICLE_ALIASES = (
-    "prefixo", "veiculo", "numero_veiculo", "num_veiculo", "nr_veiculo",
-    "codigo_veiculo", "cod_veiculo", "placa",
-)
-SPEED_ALIASES = (
-    "velocidade", "velocidade_kmh", "veloc", "speed", "vel",
-)
-TIMESTAMP_ALIASES = (
-    "data_hora", "datahora", "horario", "timestamp", "dh_posicao",
-    "ultima_atualizacao", "data_posicao", "instante",
-)
-STOP_NAME_ALIASES = (
-    "nome", "denominacao", "descricao", "desc_parada", "nome_parada",
-    "endereco", "referencia", "ponto", "logradouro",
-)
-LAT_ALIASES = ("latitude", "lat", "y")
-LON_ALIASES = ("longitude", "lon", "lng", "x")
+# A 0.167 faz o percurso para o Guará no sentido IDA.
+# Na 167.1, esse mesmo percurso aparece como VOLTA.
+ROUTE_DEFINITIONS = {
+    "0.167": {
+        "direction": "IDA",
+        "jsonld_key": "itinerary",
+        "page": f"{SITE}/horario/0.167",
+    },
+    "167.1": {
+        "direction": "VOLTA",
+        "jsonld_key": "returnTrip",
+        "page": f"{SITE}/horario/167.1",
+    },
+}
 
 
 @dataclass
 class Config:
-    lines: list[str]
-    stop_keywords: list[str]
-    stop_center_lat: float
-    stop_center_lon: float
-    stop_search_radius_m: float
-    alerts_minutes: list[int]
     monitor_start: str
     monitor_end: str
     weekdays: list[int]
-    poll_seconds: int
     timezone: str
+    alerts_minutes: list[int]
+    stop_keywords: list[str]
     default_speed_kmh: float
+    minimum_speed_kmh: float
+    maximum_speed_kmh: float
     traffic_factor: float
-    straight_line_factor: float
-    minimum_movement_m: float
-    stop_passed_radius_m: float
-    max_vehicle_age_minutes: int
+    dwell_minutes_per_stop: float
+    max_route_offset_m: float
+    passed_margin_m: float
+    stale_vehicle_minutes: int
     debug: bool
 
 
 @dataclass
-class RouteProjection:
-    remaining_m: float
-    bus_offset_m: float
-    stop_offset_m: float
-    total_m: float
+class Route:
+    line: str
+    direction: str
+    points: list[tuple[float, float]]
+    names: list[str]
+    cumulative_m: list[float]
+    stop_index: int
+    stop_name: str
+    stop_along_m: float
 
 
 @dataclass
-class VehicleObservation:
-    line: str
-    vehicle_id: str
-    lat: float
-    lon: float
-    straight_distance_m: float
-    remaining_m: float
-    observed_at: datetime
-    source_speed_kmh: float | None
+class VehicleState:
+    along_m: float
+    distance_to_stop_m: float
+    observed_monotonic: float
+    eta_minutes: float
+    speed_kmh: float
+    sent_alerts: set[int] = field(default_factory=set)
+    last_seen_epoch: float = field(default_factory=time.time)
 
 
 def load_config(path: str | Path) -> Config:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     return Config(
-        lines=[str(v) for v in raw["lines"]],
-        stop_keywords=[str(v) for v in raw["stop"]["keywords"]],
-        stop_center_lat=float(raw["stop"]["approximate_lat"]),
-        stop_center_lon=float(raw["stop"]["approximate_lon"]),
-        stop_search_radius_m=float(raw["stop"].get("search_radius_m", 3000)),
+        monitor_start=str(raw.get("monitor_start", "16:00")),
+        monitor_end=str(raw.get("monitor_end", "21:00")),
+        weekdays=[int(v) for v in raw.get("weekdays", [0, 1, 2, 3, 4])],
+        timezone=str(raw.get("timezone", "America/Sao_Paulo")),
         alerts_minutes=sorted(
             [int(v) for v in raw.get("alerts_minutes", [30, 15])],
             reverse=True,
         ),
-        monitor_start=str(raw.get("monitor_start", "16:00")),
-        monitor_end=str(raw.get("monitor_end", "21:00")),
-        weekdays=[int(v) for v in raw.get("weekdays", [0, 1, 2, 3, 4])],
-        poll_seconds=max(30, int(raw.get("poll_seconds", 60))),
-        timezone=str(raw.get("timezone", "America/Sao_Paulo")),
-        default_speed_kmh=float(raw.get("default_speed_kmh", 25)),
-        traffic_factor=float(raw.get("traffic_factor", 1.15)),
-        straight_line_factor=float(raw.get("straight_line_factor", 1.35)),
-        minimum_movement_m=float(raw.get("minimum_movement_m", 35)),
-        stop_passed_radius_m=float(raw.get("stop_passed_radius_m", 120)),
-        max_vehicle_age_minutes=int(raw.get("max_vehicle_age_minutes", 15)),
+        stop_keywords=[
+            str(v).lower()
+            for v in raw.get("stop_keywords", ["galois", "oab"])
+        ],
+        default_speed_kmh=float(raw.get("default_speed_kmh", 23)),
+        minimum_speed_kmh=float(raw.get("minimum_speed_kmh", 8)),
+        maximum_speed_kmh=float(raw.get("maximum_speed_kmh", 55)),
+        traffic_factor=float(raw.get("traffic_factor", 1.12)),
+        dwell_minutes_per_stop=float(raw.get("dwell_minutes_per_stop", 0.22)),
+        max_route_offset_m=float(raw.get("max_route_offset_m", 1200)),
+        passed_margin_m=float(raw.get("passed_margin_m", 100)),
+        stale_vehicle_minutes=int(raw.get("stale_vehicle_minutes", 10)),
         debug=bool(raw.get("debug", False)),
     )
 
 
-def norm_text(value: Any) -> str:
-    text = unicodedata.normalize("NFKD", str(value))
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
-
-
-def norm_line(value: Any) -> str:
-    """Normaliza 0.167, 167, 0167 e pequenas variações."""
-    text = str(value).strip().replace(",", ".")
-    text = re.sub(r"\s+", "", text)
-    text = re.sub(r"^[A-Za-z]+", "", text)
-    if re.fullmatch(r"0+\d+\.\d+", text):
-        text = text.lstrip("0")
-        if text.startswith("."):
-            text = "0" + text
-    elif re.fullmatch(r"0+\d+", text):
-        text = text.lstrip("0") or "0"
-    # A linha 0.167 é tratada como 167; 167.1 permanece 167.1.
-    if re.fullmatch(r"0\.\d{3}", text):
-        text = text[2:].lstrip("0") or "0"
-    return text
-
-
-def property_lookup(properties: dict[str, Any], aliases: Iterable[str]) -> Any | None:
-    normalized = {norm_text(k): v for k, v in properties.items()}
-    for alias in aliases:
-        if norm_text(alias) in normalized:
-            value = normalized[norm_text(alias)]
-            if value not in (None, ""):
-                return value
-    return None
-
-
-def find_property_name(features: list[dict[str, Any]], aliases: Iterable[str]) -> str | None:
-    alias_set = {norm_text(a) for a in aliases}
-    for feature in features:
-        for key in feature.get("properties", {}):
-            if norm_text(key) in alias_set:
-                return key
-    return None
-
-
-def wfs_get(
-    layer: str,
-    *,
-    max_features: int,
-    cql_filter: str | None = None,
-    bbox: tuple[float, float, float, float] | None = None,
-) -> dict[str, Any]:
-    params = {
-        "service": "WFS",
-        "version": "1.0.0",
-        "request": "GetFeature",
-        "typeName": layer,
-        "outputFormat": "application/json",
-        "srsName": "EPSG:4326",
-        "maxFeatures": str(max_features),
-    }
-    if cql_filter:
-        params["CQL_FILTER"] = cql_filter
-    if bbox:
-        min_lon, min_lat, max_lon, max_lat = bbox
-        params["BBOX"] = (
-            f"{min_lon:.7f},{min_lat:.7f},"
-            f"{max_lon:.7f},{max_lat:.7f},EPSG:4326"
-        )
-
-    try:
-        response = HTTP.get(
-            WFS_URL,
-            params=params,
-            timeout=(REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT),
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise RuntimeError(
-            f"A Semob não respondeu à consulta da camada {layer}. "
-            f"Tentativas automáticas esgotadas: {exc}"
-        ) from exc
-
-    try:
-        data = response.json()
-    except ValueError as exc:
-        trecho = response.text[:300].replace("\n", " ")
-        raise RuntimeError(
-            f"A Semob devolveu uma resposta que não é JSON para {layer}: {trecho}"
-        ) from exc
-
-    if not isinstance(data, dict) or "features" not in data:
-        raise RuntimeError(f"Resposta inesperada da camada {layer}.")
-    return data
-
-
-def line_variants(lines: Iterable[str]) -> set[str]:
-    result: set[str] = set()
-    for original in lines:
-        text = str(original).strip()
-        normalized = norm_line(text)
-        result.update({text, normalized})
-        if normalized == "167":
-            result.add("0.167")
-        if re.fullmatch(r"\d+\.\d+", normalized):
-            result.add(normalized)
-    return {v for v in result if v}
-
-
-def extract_line(feature: dict[str, Any], field_name: str | None = None) -> str | None:
-    props = feature.get("properties", {})
-    value = props.get(field_name) if field_name else property_lookup(props, LINE_ALIASES)
-    if value in (None, ""):
-        # Último recurso: procura valor com formato típico de linha.
-        for candidate in props.values():
-            text = str(candidate).strip().replace(",", ".")
-            if re.fullmatch(r"0?\d{1,3}(?:\.\d{1,2})?", text):
-                value = candidate
-                break
-    return norm_line(value) if value not in (None, "") else None
-
-
-def fetch_features_for_lines(
-    layer: str,
-    lines: list[str],
-    *,
-    all_limit: int,
-    debug: bool = False,
-) -> tuple[list[dict[str, Any]], str | None]:
-    target = {norm_line(v) for v in lines}
-    sample = wfs_get(layer, max_features=100).get("features", [])
-    line_field = find_property_name(sample, LINE_ALIASES)
-
-    if debug:
-        print(f"[debug] {layer}: campo provável da linha = {line_field!r}")
-
-    # Primeiro tenta filtrar no servidor para reduzir o tráfego.
-    if line_field:
-        variants = sorted(line_variants(lines))
-        quoted_values = ",".join("'" + v.replace("'", "''") + "'" for v in variants)
-        filters = [f"{line_field} IN ({quoted_values})"]
-        numeric_values = [v for v in variants if re.fullmatch(r"\d+(?:\.\d+)?", v)]
-        if numeric_values:
-            filters.append(f"{line_field} IN ({','.join(numeric_values)})")
-
-        for cql in filters:
-            try:
-                items = wfs_get(layer, max_features=all_limit, cql_filter=cql).get("features", [])
-                filtered = [f for f in items if extract_line(f, line_field) in target]
-                if filtered:
-                    return filtered, line_field
-            except (requests.RequestException, ValueError, RuntimeError):
-                pass
-
-    # Compatibilidade: baixa a camada e filtra localmente.
-    items = wfs_get(layer, max_features=all_limit).get("features", [])
-    filtered = [f for f in items if extract_line(f, line_field) in target]
-    return filtered, line_field
-
-
-def point_from_feature(feature: dict[str, Any]) -> tuple[float, float] | None:
-    geometry = feature.get("geometry") or {}
-    coords = geometry.get("coordinates")
-    geo_type = geometry.get("type")
-
-    if geo_type == "Point" and isinstance(coords, list) and len(coords) >= 2:
-        lon, lat = float(coords[0]), float(coords[1])
-        return lat, lon
-    if geo_type == "MultiPoint" and coords and len(coords[0]) >= 2:
-        lon, lat = float(coords[0][0]), float(coords[0][1])
-        return lat, lon
-
-    props = feature.get("properties", {})
-    lat = property_lookup(props, LAT_ALIASES)
-    lon = property_lookup(props, LON_ALIASES)
-    if lat not in (None, "") and lon not in (None, ""):
-        try:
-            return float(str(lat).replace(",", ".")), float(str(lon).replace(",", "."))
-        except ValueError:
-            return None
-    return None
-
-
-def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    p1, p2 = math.radians(lat1), math.radians(lat2)
+def haversine_m(
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+) -> float:
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
     dp = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
-
-
-def all_text(properties: dict[str, Any]) -> str:
-    return " ".join(norm_text(v).replace("_", " ") for v in properties.values() if v is not None)
-
-
-def discover_stop(config: Config) -> tuple[dict[str, Any], float, float, str]:
-    # Em vez de baixar todas as paradas do DF, consulta apenas a região da OAB.
-    lat_delta = config.stop_search_radius_m / 111_320.0
-    lon_scale = max(0.2, math.cos(math.radians(config.stop_center_lat)))
-    lon_delta = config.stop_search_radius_m / (111_320.0 * lon_scale)
-
-    bbox = (
-        config.stop_center_lon - lon_delta,
-        config.stop_center_lat - lat_delta,
-        config.stop_center_lon + lon_delta,
-        config.stop_center_lat + lat_delta,
+    value = (
+        math.sin(dp / 2) ** 2
+        + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     )
+    return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(value))
 
-    features = wfs_get(
-        STOP_LAYER,
-        max_features=1_000,
-        bbox=bbox,
-    ).get("features", [])
 
-    wanted = [norm_text(v).replace("_", " ") for v in config.stop_keywords]
-
-    candidates: list[tuple[int, float, dict[str, Any], float, float, str]] = []
-    for feature in features:
-        point = point_from_feature(feature)
-        if not point:
-            continue
-        lat, lon = point
-        distance = haversine_m(
-            config.stop_center_lat,
-            config.stop_center_lon,
-            lat,
-            lon,
-        )
-        if distance > config.stop_search_radius_m:
-            continue
-
-        props = feature.get("properties", {})
-        haystack = all_text(props)
-        matches = sum(1 for word in wanted if word and word in haystack)
-        name = property_lookup(props, STOP_NAME_ALIASES)
-        if name is None:
-            meaningful = [
-                str(v) for v in props.values()
-                if isinstance(v, str) and len(v.strip()) >= 5
-            ]
-            name = (
-                " | ".join(meaningful[:3])
-                if meaningful
-                else str(feature.get("id", "parada"))
+def cumulative_distances(
+    points: list[tuple[float, float]],
+) -> list[float]:
+    result = [0.0]
+    for index in range(1, len(points)):
+        result.append(
+            result[-1]
+            + haversine_m(
+                points[index - 1][0],
+                points[index - 1][1],
+                points[index][0],
+                points[index][1],
             )
-        candidates.append((matches, distance, feature, lat, lon, str(name)))
-
-    if not candidates:
-        raise RuntimeError(
-            "A Semob respondeu, mas nenhuma parada foi encontrada perto das "
-            "coordenadas configuradas. Ajuste approximate_lat/approximate_lon "
-            "no config.json."
         )
+    return result
 
-    candidates.sort(key=lambda item: (-item[0], item[1]))
-    matches, distance, feature, lat, lon, name = candidates[0]
 
-    if matches == 0:
-        print(
-            "[aviso] Nenhuma descrição coincidiu com as palavras-chave; "
-            "foi escolhida a parada mais próxima das coordenadas."
-        )
-
-    print(
-        f"[parada] {name}\n"
-        f"         latitude={lat:.6f}, longitude={lon:.6f}, "
-        f"distância do ponto aproximado={distance:.0f} m, "
-        f"palavras coincidentes={matches}"
+def local_xy(
+    lat: float,
+    lon: float,
+    ref_lat: float,
+    ref_lon: float,
+) -> tuple[float, float]:
+    x = (
+        math.radians(lon - ref_lon)
+        * EARTH_RADIUS_M
+        * math.cos(math.radians(ref_lat))
     )
-    return feature, lat, lon, name
-
-
-def flatten_route_geometry(geometry: dict[str, Any]) -> list[list[tuple[float, float]]]:
-    """Retorna partes como listas de (lat, lon)."""
-    geo_type = geometry.get("type")
-    coords = geometry.get("coordinates") or []
-    parts: list[list[tuple[float, float]]] = []
-
-    if geo_type == "LineString":
-        parts = [[(float(y), float(x)) for x, y, *_ in coords]]
-    elif geo_type == "MultiLineString":
-        parts = [[(float(y), float(x)) for x, y, *_ in part] for part in coords]
-    elif geo_type == "GeometryCollection":
-        for item in geometry.get("geometries", []):
-            parts.extend(flatten_route_geometry(item))
-
-    return [part for part in parts if len(part) >= 2]
-
-
-def local_xy(lat: float, lon: float, ref_lat: float, ref_lon: float) -> tuple[float, float]:
-    x = math.radians(lon - ref_lon) * EARTH_RADIUS_M * math.cos(math.radians(ref_lat))
     y = math.radians(lat - ref_lat) * EARTH_RADIUS_M
     return x, y
 
 
-def project_on_polyline(
+def project_on_route(
     lat: float,
     lon: float,
-    points: list[tuple[float, float]],
-) -> tuple[float, float, float]:
-    """Retorna (distância acumulada até a projeção, afastamento, total)."""
-    ref_lat, ref_lon = lat, lon
-    xy = [local_xy(p_lat, p_lon, ref_lat, ref_lon) for p_lat, p_lon in points]
-    best_offset = float("inf")
-    best_along = 0.0
-    accumulated = 0.0
-    total = 0.0
+    route: Route,
+    previous_along_m: float | None = None,
+) -> tuple[float, float, int]:
+    """
+    Retorna:
+    - distância acumulada no itinerário;
+    - afastamento lateral do itinerário;
+    - índice do segmento.
 
-    segment_lengths: list[float] = []
-    for index in range(len(xy) - 1):
-        x1, y1 = xy[index]
-        x2, y2 = xy[index + 1]
-        length = math.hypot(x2 - x1, y2 - y1)
-        segment_lengths.append(length)
-        total += length
+    Quando há cruzamentos no itinerário, a posição anterior ajuda a escolher
+    o segmento coerente.
+    """
+    candidates: list[tuple[float, float, float, int]] = []
 
-    for index, length in enumerate(segment_lengths):
-        x1, y1 = xy[index]
-        x2, y2 = xy[index + 1]
-        if length <= 0:
-            continue
-        vx, vy = x2 - x1, y2 - y1
-        # O ponto consultado é a origem (0,0).
-        t = max(0.0, min(1.0, (-(x1 * vx + y1 * vy)) / (length * length)))
-        px, py = x1 + t * vx, y1 + t * vy
-        offset = math.hypot(px, py)
-        if offset < best_offset:
-            best_offset = offset
-            best_along = accumulated + t * length
-        accumulated += length
+    for index in range(len(route.points) - 1):
+        lat1, lon1 = route.points[index]
+        lat2, lon2 = route.points[index + 1]
 
-    return best_along, best_offset, total
+        x1, y1 = local_xy(lat1, lon1, lat, lon)
+        x2, y2 = local_xy(lat2, lon2, lat, lon)
 
-
-def build_route_parts(
-    config: Config,
-) -> dict[str, list[list[tuple[float, float]]]]:
-    features, _ = fetch_features_for_lines(
-        ROUTE_LAYER,
-        config.lines,
-        all_limit=20_000,
-        debug=config.debug,
-    )
-    routes: dict[str, list[list[tuple[float, float]]]] = {
-        norm_line(line): [] for line in config.lines
-    }
-    for feature in features:
-        line = extract_line(feature)
-        if not line:
-            continue
-        routes.setdefault(line, []).extend(flatten_route_geometry(feature.get("geometry") or {}))
-
-    for line, parts in routes.items():
-        print(f"[itinerário] linha {line}: {len(parts)} trecho(s) encontrado(s)")
-    return routes
-
-
-def route_remaining(
-    line: str,
-    bus_lat: float,
-    bus_lon: float,
-    stop_lat: float,
-    stop_lon: float,
-    routes: dict[str, list[list[tuple[float, float]]]],
-) -> RouteProjection | None:
-    best: tuple[float, RouteProjection] | None = None
-    for part in routes.get(norm_line(line), []):
-        bus_along, bus_offset, total = project_on_polyline(bus_lat, bus_lon, part)
-        stop_along, stop_offset, _ = project_on_polyline(stop_lat, stop_lon, part)
-
-        # Ignora geometrias que não representam o trecho atual.
-        if bus_offset > 800 or stop_offset > 800:
+        vx = x2 - x1
+        vy = y2 - y1
+        segment_m = math.hypot(vx, vy)
+        if segment_m <= 0:
             continue
 
-        remaining = abs(stop_along - bus_along)
-        projection = RouteProjection(
-            remaining_m=remaining,
-            bus_offset_m=bus_offset,
-            stop_offset_m=stop_offset,
-            total_m=total,
+        t = max(
+            0.0,
+            min(
+                1.0,
+                -(x1 * vx + y1 * vy) / (segment_m * segment_m),
+            ),
         )
-        score = bus_offset + stop_offset + 0.002 * remaining
-        if best is None or score < best[0]:
-            best = (score, projection)
 
-    return best[1] if best else None
+        px = x1 + t * vx
+        py = y1 + t * vy
+        offset_m = math.hypot(px, py)
+        along_m = route.cumulative_m[index] + t * segment_m
+
+        continuity_penalty = 0.0
+        if previous_along_m is not None:
+            continuity_penalty = min(
+                3000.0,
+                abs(along_m - previous_along_m) * 0.12,
+            )
+
+        score = offset_m + continuity_penalty
+        candidates.append((score, along_m, offset_m, index))
+
+    if not candidates:
+        raise RuntimeError(f"Itinerário inválido para a linha {route.line}.")
+
+    _, along_m, offset_m, segment_index = min(
+        candidates,
+        key=lambda item: item[0],
+    )
+    return along_m, offset_m, segment_index
 
 
-def parse_datetime(value: Any, tz: ZoneInfo) -> datetime | None:
-    if value in (None, ""):
-        return None
-    text = str(value).strip()
-    candidates = [
-        text,
-        text.replace("Z", "+00:00"),
-        text.replace(" ", "T"),
-    ]
-    for candidate in candidates:
+def walk_dicts(value: Any):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from walk_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk_dicts(child)
+
+
+def extract_jsonld(html_text: str) -> list[Any]:
+    blocks = re.findall(
+        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>'
+        r'(.*?)</script>',
+        html_text,
+        flags=re.I | re.S,
+    )
+
+    parsed = []
+    for block in blocks:
         try:
-            result = datetime.fromisoformat(candidate)
-            if result.tzinfo is None:
-                result = result.replace(tzinfo=tz)
-            return result.astimezone(tz)
-        except ValueError:
-            pass
-    for fmt in ("%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M"):
-        try:
-            return datetime.strptime(text, fmt).replace(tzinfo=tz)
-        except ValueError:
-            pass
+            parsed.append(json.loads(html.unescape(block).strip()))
+        except json.JSONDecodeError:
+            continue
+    return parsed
+
+
+def find_trip_data(
+    document: Any,
+    key: str,
+) -> dict[str, Any] | None:
+    for item in walk_dicts(document):
+        candidate = item.get(key)
+        if (
+            isinstance(candidate, dict)
+            and isinstance(candidate.get("itemListElement"), list)
+        ):
+            return candidate
     return None
 
 
-def numeric_speed(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
+def parse_trip_stops(trip: dict[str, Any]) -> tuple[
+    list[tuple[float, float]],
+    list[str],
+]:
+    records = sorted(
+        trip.get("itemListElement", []),
+        key=lambda item: int(item.get("position", 0)),
+    )
+
+    points: list[tuple[float, float]] = []
+    names: list[str] = []
+
+    for record in records:
+        item = record.get("item") or {}
+        geo = item.get("geo") or {}
+
+        try:
+            lat = float(geo["latitude"])
+            lon = float(geo["longitude"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        name = str(item.get("name") or f"Parada {len(points) + 1}")
+        points.append((lat, lon))
+        names.append(name)
+
+    if len(points) < 2:
+        raise RuntimeError("O itinerário não contém paradas suficientes.")
+
+    return points, names
+
+
+def load_route(
+    line: str,
+    definition: dict[str, str],
+    config: Config,
+) -> Route:
+    response = requests.get(
+        definition["page"],
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,*/*",
+            "Accept-Language": "pt-BR,pt;q=0.9",
+        },
+        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+    )
+    response.raise_for_status()
+
+    documents = extract_jsonld(response.text)
+    trip = None
+    for document in documents:
+        trip = find_trip_data(document, definition["jsonld_key"])
+        if trip:
+            break
+
+    if not trip:
+        raise RuntimeError(
+            f"Não encontrei o itinerário {definition['jsonld_key']} "
+            f"da linha {line}."
+        )
+
+    points, names = parse_trip_stops(trip)
+    cumulative = cumulative_distances(points)
+
+    stop_candidates = [
+        index
+        for index, name in enumerate(names)
+        if any(keyword in name.lower() for keyword in config.stop_keywords)
+    ]
+
+    if not stop_candidates:
+        raise RuntimeError(
+            f"Não encontrei a parada OAB/Galois no itinerário da linha {line}."
+        )
+
+    stop_index = stop_candidates[0]
+
+    route = Route(
+        line=line,
+        direction=definition["direction"],
+        points=points,
+        names=names,
+        cumulative_m=cumulative,
+        stop_index=stop_index,
+        stop_name=names[stop_index],
+        stop_along_m=cumulative[stop_index],
+    )
+
+    print(
+        f"[itinerário] linha {line} | sentido {route.direction} | "
+        f"{len(points)} paradas | alvo nº {stop_index + 1}: "
+        f"{route.stop_name}"
+    )
+    return route
+
+
+def extract_coordinates(vehicle: dict[str, Any]) -> tuple[float, float] | None:
+    location = vehicle.get("localizacao") or {}
+
+    lat = location.get("latitude", location.get("lat"))
+    lon = location.get("longitude", location.get("lng"))
+
     try:
-        speed = float(str(value).replace(",", "."))
-    except ValueError:
+        return float(lat), float(lon)
+    except (TypeError, ValueError):
         return None
-    return speed if 1 <= speed <= 100 else None
 
 
-def vehicle_id(feature: dict[str, Any]) -> str:
-    value = property_lookup(feature.get("properties", {}), VEHICLE_ALIASES)
-    return str(value).strip() if value not in (None, "") else str(feature.get("id", "desconhecido"))
+def extract_speed(vehicle: dict[str, Any]) -> float | None:
+    value = vehicle.get("velocidade")
+
+    if isinstance(value, dict):
+        value = value.get("valor")
+
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    return speed if 0 <= speed <= 120 else None
 
 
-def get_position_timestamp(feature: dict[str, Any], tz: ZoneInfo) -> datetime | None:
-    value = property_lookup(feature.get("properties", {}), TIMESTAMP_ALIASES)
-    return parse_datetime(value, tz)
+def canonical_vehicle_number(vehicle: dict[str, Any]) -> str:
+    number = str(vehicle.get("numero") or vehicle.get("key") or "desconhecido")
+    return re.sub(r"^mb-", "", number, flags=re.I)
 
 
-def get_source_speed(feature: dict[str, Any]) -> float | None:
-    value = property_lookup(feature.get("properties", {}), SPEED_ALIASES)
-    return numeric_speed(value)
+def detailed_score(vehicle: dict[str, Any]) -> int:
+    return sum(
+        1
+        for key in ("horario", "velocidade", "direcao", "codigoImei", "valid")
+        if key in vehicle
+    )
+
+
+def deduplicate_vehicles(
+    vehicles: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    selected: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for vehicle in vehicles:
+        line = str(vehicle.get("linha") or "")
+        number = canonical_vehicle_number(vehicle)
+        key = (line, number)
+
+        current = selected.get(key)
+        if current is None or detailed_score(vehicle) > detailed_score(current):
+            selected[key] = vehicle
+
+    return list(selected.values())
+
+
+def is_stale(vehicle: dict[str, Any], config: Config) -> bool:
+    raw = vehicle.get("horario")
+    if raw is None:
+        return False
+
+    try:
+        timestamp = float(raw)
+    except (TypeError, ValueError):
+        return False
+
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000.0
+
+    age_seconds = time.time() - timestamp
+    return age_seconds > config.stale_vehicle_minutes * 60
+
+
+def parse_clock(value: str) -> clock_time:
+    hour, minute = value.split(":", 1)
+    return clock_time(int(hour), int(minute))
 
 
 class Telegram:
     def __init__(self) -> None:
         self.token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        raw_ids = os.getenv("TELEGRAM_CHAT_IDS", "")
-        self.chat_ids = [item.strip() for item in raw_ids.split(",") if item.strip()]
+        self.chat_ids = [
+            item.strip()
+            for item in os.getenv("TELEGRAM_CHAT_IDS", "").split(",")
+            if item.strip()
+        ]
 
     def validate(self) -> None:
         if not self.token:
-            raise RuntimeError("Defina TELEGRAM_BOT_TOKEN.")
+            raise RuntimeError("Secret TELEGRAM_BOT_TOKEN não configurado.")
         if not self.chat_ids:
-            raise RuntimeError("Defina TELEGRAM_CHAT_IDS com um ou mais IDs separados por vírgula.")
+            raise RuntimeError("Secret TELEGRAM_CHAT_IDS não configurado.")
 
     def send(self, text: str) -> None:
         self.validate()
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        errors: list[str] = []
+        failures = []
+
         for chat_id in self.chat_ids:
             try:
                 response = requests.post(
@@ -622,359 +490,559 @@ class Telegram:
                         "text": text,
                         "disable_web_page_preview": True,
                     },
-                    timeout=(REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT),
+                    timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
                 )
                 response.raise_for_status()
-                payload = response.json()
-                if not payload.get("ok"):
-                    errors.append(f"{chat_id}: {payload}")
-            except (requests.RequestException, ValueError) as exc:
-                errors.append(f"{chat_id}: {exc}")
-        if errors:
-            raise RuntimeError("Falha no Telegram: " + " | ".join(errors))
+            except requests.RequestException as error:
+                failures.append(f"{chat_id}: {error}")
 
-    def show_updates(self) -> None:
-        if not self.token:
-            raise RuntimeError("Defina TELEGRAM_BOT_TOKEN antes de consultar as mensagens.")
-        url = f"https://api.telegram.org/bot{self.token}/getUpdates"
-        response = requests.get(url, params={"timeout": 0, "limit": 100}, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        payload = response.json()
-        if not payload.get("ok"):
-            raise RuntimeError(str(payload))
-
-        found: dict[str, dict[str, Any]] = {}
-        for update in payload.get("result", []):
-            message = (
-                update.get("message")
-                or update.get("edited_message")
-                or update.get("channel_post")
-                or {}
+        if failures:
+            raise RuntimeError(
+                "Falha ao enviar ao Telegram: " + " | ".join(failures)
             )
-            chat = message.get("chat") or {}
-            if "id" not in chat:
-                continue
-            cid = str(chat["id"])
-            found[cid] = {
-                "chat_id": cid,
-                "nome": " ".join(
-                    str(v) for v in (chat.get("first_name"), chat.get("last_name")) if v
-                ).strip(),
-                "usuario": chat.get("username"),
-                "ultima_mensagem": message.get("text"),
+
+
+class PollingSocket:
+    def __init__(self) -> None:
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Origin": SOCKET_ORIGIN,
+                "Referer": SOCKET_ORIGIN + "/",
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+                ),
+                "Accept": "*/*",
             }
+        )
+        self.sid: str | None = None
 
-        if not found:
-            print(
-                "Nenhuma conversa apareceu. Peça à pessoa que abra o bot, toque em "
-                "\"Iniciar\" e envie uma mensagem identificável; depois execute novamente."
-            )
-            return
+    def params(self) -> dict[str, str]:
+        values = {
+            "EIO": "4",
+            "transport": "polling",
+            "t": str(int(time.time() * 1000)),
+        }
+        if self.sid:
+            values["sid"] = self.sid
+        return values
 
-        print("\nConversas encontradas:")
-        for item in found.values():
-            print(
-                f"- chat_id={item['chat_id']} | nome={item['nome'] or '-'} "
-                f"| usuário=@{item['usuario'] or '-'} "
-                f"| mensagem={item['ultima_mensagem']!r}"
-            )
+    def get(self) -> str:
+        response = self.session.get(
+            SOCKET_PATH,
+            params=self.params(),
+            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+        )
+        response.raise_for_status()
+        return response.text
+
+    def post(self, payload: str) -> None:
+        response = self.session.post(
+            SOCKET_PATH,
+            params=self.params(),
+            data=payload.encode("utf-8"),
+            headers={"Content-Type": "text/plain;charset=UTF-8"},
+            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+        )
+        response.raise_for_status()
+
+    @staticmethod
+    def split(payload: str) -> list[str]:
+        return [
+            packet
+            for packet in payload.split(RECORD_SEPARATOR)
+            if packet
+        ]
+
+    def connect(self) -> None:
+        initial = self.split(self.get())
+        open_packet = next(
+            (packet for packet in initial if packet.startswith("0")),
+            None,
+        )
+        if not open_packet:
+            raise RuntimeError("Handshake Engine.IO inválido.")
+
+        info = json.loads(open_packet[1:])
+        self.sid = str(info["sid"])
+        self.post("40")
+
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            for packet in self.poll():
+                if packet.startswith("40"):
+                    print(f"[fonte] Socket conectado. SID {self.sid}")
+                    return
+                if packet.startswith("44"):
+                    raise RuntimeError(
+                        "O servidor recusou o namespace: " + packet
+                    )
+
+        raise TimeoutError("O Socket.IO não confirmou a conexão.")
+
+    def emit(self, event: str, data: Any) -> None:
+        payload = "42" + json.dumps(
+            [event, data],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.post(payload)
+
+    def poll(self) -> list[str]:
+        packets = self.split(self.get())
+        for packet in packets:
+            if packet == "2":
+                self.post("3")
+        return packets
+
+
+def parse_event(packet: str) -> tuple[str, Any] | None:
+    if not packet.startswith("42"):
+        return None
+
+    try:
+        content = json.loads(packet[2:])
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(content, list) or len(content) < 2:
+        return None
+
+    return str(content[0]), content[1]
 
 
 class Monitor:
-    def __init__(self, config: Config, telegram: Telegram) -> None:
+    def __init__(
+        self,
+        config: Config,
+        telegram: Telegram,
+    ) -> None:
         self.config = config
         self.telegram = telegram
-        self.tz = ZoneInfo(config.timezone)
-        self.stop_feature: dict[str, Any] | None = None
-        self.stop_lat = 0.0
-        self.stop_lon = 0.0
-        self.stop_name = ""
-        self.routes: dict[str, list[list[tuple[float, float]]]] = {}
-        self.previous: dict[str, VehicleObservation] = {}
-        self.sent: dict[str, set[int]] = {}
-        self.passed: set[str] = set()
+        self.timezone = ZoneInfo(config.timezone)
+        self.routes: dict[str, Route] = {}
+        self.states: dict[str, VehicleState] = {}
 
-    def initialize(self) -> None:
-        self.stop_feature, self.stop_lat, self.stop_lon, self.stop_name = discover_stop(self.config)
-        self.routes = build_route_parts(self.config)
+    def initialize_routes(self) -> None:
+        for line, definition in ROUTE_DEFINITIONS.items():
+            self.routes[line] = load_route(line, definition, self.config)
 
-    def estimate_speed(
+    def vehicle_speed(
         self,
-        previous: VehicleObservation | None,
-        current_lat: float,
-        current_lon: float,
-        now: datetime,
-        source_speed: float | None,
+        previous: VehicleState | None,
+        along_m: float,
+        reported_speed: float | None,
+        now_monotonic: float,
     ) -> float:
-        observed: float | None = None
-        if previous:
-            seconds = (now - previous.observed_at).total_seconds()
-            if seconds >= 10:
-                moved_m = haversine_m(previous.lat, previous.lon, current_lat, current_lon)
-                candidate = moved_m / seconds * 3.6
-                if 5 <= candidate <= 80:
-                    observed = candidate
+        observed_speed = None
 
-        if observed is not None and source_speed is not None:
-            speed = 0.7 * observed + 0.3 * source_speed
-        elif observed is not None:
-            speed = observed
-        elif source_speed is not None:
-            speed = source_speed
+        if previous:
+            seconds = now_monotonic - previous.observed_monotonic
+            movement_m = along_m - previous.along_m
+
+            if seconds >= 10 and movement_m > 15:
+                candidate = movement_m / seconds * 3.6
+                if (
+                    self.config.minimum_speed_kmh
+                    <= candidate
+                    <= self.config.maximum_speed_kmh
+                ):
+                    observed_speed = candidate
+
+        values = []
+        if observed_speed is not None:
+            values.extend([observed_speed, observed_speed])
+        if (
+            reported_speed is not None
+            and self.config.minimum_speed_kmh
+            <= reported_speed
+            <= self.config.maximum_speed_kmh
+        ):
+            values.append(reported_speed)
+        if previous and (
+            self.config.minimum_speed_kmh
+            <= previous.speed_kmh
+            <= self.config.maximum_speed_kmh
+        ):
+            values.append(previous.speed_kmh)
+
+        if values:
+            speed = sum(values) / len(values)
         else:
             speed = self.config.default_speed_kmh
 
-        return max(8.0, min(60.0, speed))
-
-    def process_vehicle(self, feature: dict[str, Any], now: datetime) -> None:
-        point = point_from_feature(feature)
-        line = extract_line(feature)
-        if not point or not line:
-            return
-
-        target = {norm_line(v) for v in self.config.lines}
-        if line not in target:
-            return
-
-        timestamp = get_position_timestamp(feature, self.tz)
-        if timestamp and (now - timestamp).total_seconds() > self.config.max_vehicle_age_minutes * 60:
-            return
-
-        lat, lon = point
-        prefix = vehicle_id(feature)
-        key = f"{line}|{prefix}"
-        straight = haversine_m(lat, lon, self.stop_lat, self.stop_lon)
-        projection = route_remaining(
-            line, lat, lon, self.stop_lat, self.stop_lon, self.routes
-        )
-        remaining = (
-            projection.remaining_m
-            if projection
-            else straight * self.config.straight_line_factor
+        return max(
+            self.config.minimum_speed_kmh,
+            min(self.config.maximum_speed_kmh, speed),
         )
 
-        previous = self.previous.get(key)
-        source_speed = get_source_speed(feature)
-        speed_kmh = self.estimate_speed(previous, lat, lon, now, source_speed)
-        eta = remaining / 1000 / speed_kmh * 60 * self.config.traffic_factor
-
-        current = VehicleObservation(
-            line=line,
-            vehicle_id=prefix,
-            lat=lat,
-            lon=lon,
-            straight_distance_m=straight,
-            remaining_m=remaining,
-            observed_at=now,
-            source_speed_kmh=source_speed,
+    def estimate_eta(
+        self,
+        route: Route,
+        distance_m: float,
+        segment_index: int,
+        speed_kmh: float,
+    ) -> float:
+        travel_minutes = (
+            distance_m / 1000.0 / speed_kmh * 60.0
+            * self.config.traffic_factor
         )
 
-        if straight <= self.config.stop_passed_radius_m:
-            self.passed.add(key)
-            self.previous[key] = current
+        remaining_stops = max(
+            0,
+            route.stop_index - segment_index - 1,
+        )
+        dwell_minutes = (
+            remaining_stops * self.config.dwell_minutes_per_stop
+        )
+        return travel_minutes + dwell_minutes
+
+    def choose_alert(
+        self,
+        previous_eta: float | None,
+        current_eta: float,
+        already_sent: set[int],
+    ) -> int | None:
+        candidates = []
+
+        for threshold in self.config.alerts_minutes:
+            if threshold in already_sent:
+                continue
+            if current_eta > threshold:
+                continue
+
+            # Evita enviar o alerta de 30 min quando o ônibus já está,
+            # por exemplo, a apenas 10 min.
+            if current_eta < threshold * 0.52:
+                continue
+
+            if previous_eta is None or previous_eta > threshold:
+                candidates.append(threshold)
+
+        if not candidates:
+            return None
+
+        # Se uma atualização pulou vários limites, envia o alerta mais
+        # próximo do ETA atual.
+        return min(candidates)
+
+    def process_vehicle(self, vehicle: dict[str, Any]) -> None:
+        line = str(vehicle.get("linha") or "")
+        route = self.routes.get(line)
+        if route is None:
             return
 
-        approaching = False
-        if previous:
-            route_gain = previous.remaining_m - current.remaining_m
-            straight_gain = previous.straight_distance_m - current.straight_distance_m
-            approaching = (
-                route_gain >= self.config.minimum_movement_m
-                or straight_gain >= self.config.minimum_movement_m
-            )
+        direction = str(vehicle.get("sentido") or "").upper()
+        if direction != route.direction:
+            return
+
+        if vehicle.get("valid") is False:
+            return
+        if is_stale(vehicle, self.config):
+            return
+
+        coordinates = extract_coordinates(vehicle)
+        if coordinates is None:
+            return
+
+        number = canonical_vehicle_number(vehicle)
+        state_key = f"{line}|{number}"
+        previous = self.states.get(state_key)
+
+        lat, lon = coordinates
+        along_m, offset_m, segment_index = project_on_route(
+            lat,
+            lon,
+            route,
+            previous.along_m if previous else None,
+        )
+
+        if offset_m > self.config.max_route_offset_m:
+            if self.config.debug:
+                print(
+                    f"[ignorado] {line}/{number}: "
+                    f"{offset_m:.0f} m fora do itinerário"
+                )
+            return
+
+        distance_m = route.stop_along_m - along_m
+
+        # O veículo já chegou ou passou da OAB.
+        if distance_m <= self.config.passed_margin_m:
+            return
+
+        now_monotonic = time.monotonic()
+        speed_kmh = self.vehicle_speed(
+            previous,
+            along_m,
+            extract_speed(vehicle),
+            now_monotonic,
+        )
+        eta_minutes = self.estimate_eta(
+            route,
+            distance_m,
+            segment_index,
+            speed_kmh,
+        )
+
+        sent_alerts = set(previous.sent_alerts) if previous else set()
+        alert = self.choose_alert(
+            previous.eta_minutes if previous else None,
+            eta_minutes,
+            sent_alerts,
+        )
 
         if self.config.debug:
             print(
-                f"[debug] linha={line} veículo={prefix} "
-                f"reta={straight/1000:.2f} km restante={remaining/1000:.2f} km "
-                f"vel={speed_kmh:.1f} km/h eta={eta:.1f} min "
-                f"aproximando={approaching}"
+                f"[posição] linha={line} veículo={number} "
+                f"sentido={direction} distância={distance_m/1000:.2f} km "
+                f"velocidade={speed_kmh:.1f} km/h ETA={eta_minutes:.1f} min "
+                f"fora_da_rota={offset_m:.0f} m"
             )
 
-        if previous and approaching and key not in self.passed:
-            already = self.sent.setdefault(key, set())
-            for threshold in self.config.alerts_minutes:
-                if threshold in already:
-                    continue
+        if alert is not None:
+            rounded_eta = max(1, round(eta_minutes))
+            message = (
+                f"🚌 Linha {line} em direção ao Guará\n\n"
+                f"⏱️ Alerta de aproximadamente {alert} minutos.\n"
+                f"Estimativa atual: {rounded_eta} min para a parada "
+                f"OAB/Galois, na L2 Sul.\n\n"
+                f"Veículo: {number}\n"
+                f"Distância estimada pelo itinerário: "
+                f"{distance_m/1000:.1f} km\n\n"
+                f"⚠️ O tempo é aproximado e pode variar conforme o trânsito, "
+                f"as paradas e a atualização do GPS."
+            )
+            self.telegram.send(message)
+            sent_alerts.add(alert)
+            print(
+                f"[telegram] alerta {alert} min enviado | "
+                f"linha {line} | veículo {number} | ETA {eta_minutes:.1f}"
+            )
 
-                previous_speed = self.estimate_speed(
-                    None,
-                    previous.lat,
-                    previous.lon,
-                    previous.observed_at,
-                    previous.source_speed_kmh,
-                )
-                previous_eta = (
-                    previous.remaining_m / 1000 / previous_speed
-                    * 60 * self.config.traffic_factor
-                )
-
-                crossed = eta <= threshold and (
-                    previous_eta > threshold
-                    or not already
-                )
-                # Tolera o primeiro cálculo confiável já dentro da faixa.
-                not_too_late = eta >= max(2.0, threshold * 0.45)
-
-                if crossed and not_too_late:
-                    text = (
-                        f"🚌 Linha {display_line(line)} se aproximando\n\n"
-                        f"Estimativa: cerca de {threshold} minutos para chegar à parada "
-                        f"{self.stop_name}.\n"
-                        f"Veículo: {prefix}\n"
-                        f"Distância estimada pelo trajeto: {remaining/1000:.1f} km\n\n"
-                        f"⚠️ Previsão experimental, sujeita ao trânsito e à atualização "
-                        f"dos dados do DF no Ponto."
-                    )
-                    self.telegram.send(text)
-                    print(
-                        f"[telegram] alerta de {threshold} min enviado: "
-                        f"linha={line}, veículo={prefix}, ETA calculado={eta:.1f} min"
-                    )
-                    already.add(threshold)
-
-        self.previous[key] = current
-
-    def cycle(self) -> None:
-        now = datetime.now(self.tz)
-        features, _ = fetch_features_for_lines(
-            POSITION_LAYER,
-            self.config.lines,
-            all_limit=10_000,
-            debug=self.config.debug,
+        self.states[state_key] = VehicleState(
+            along_m=along_m,
+            distance_to_stop_m=distance_m,
+            observed_monotonic=now_monotonic,
+            eta_minutes=eta_minutes,
+            speed_kmh=speed_kmh,
+            sent_alerts=sent_alerts,
+            last_seen_epoch=time.time(),
         )
-        print(f"[{now:%d/%m/%Y %H:%M:%S}] {len(features)} posição(ões) das linhas-alvo")
-        for feature in features:
-            try:
-                self.process_vehicle(feature, now)
-            except Exception as exc:  # um veículo defeituoso não encerra o monitor
-                print(f"[aviso] Não foi possível processar um veículo: {exc}", file=sys.stderr)
 
-        # Evita crescimento indefinido do histórico.
-        cutoff = now.timestamp() - 4 * 60 * 60
-        self.previous = {
-            key: value for key, value in self.previous.items()
-            if value.observed_at.timestamp() >= cutoff
-        }
-
-    def run(self, once: bool = False) -> None:
-        self.telegram.validate()
-        self.initialize()
-        if once:
-            self.cycle()
+    def process_positions(self, data: Any) -> None:
+        if not isinstance(data, list):
             return
 
+        vehicles = [
+            item for item in data
+            if isinstance(item, dict)
+        ]
+
+        for vehicle in deduplicate_vehicles(vehicles):
+            try:
+                self.process_vehicle(vehicle)
+            except Exception as error:
+                print(
+                    f"[aviso] veículo não processado: {error}",
+                    file=sys.stderr,
+                )
+
+        cutoff = time.time() - 4 * 60 * 60
+        self.states = {
+            key: state
+            for key, state in self.states.items()
+            if state.last_seen_epoch >= cutoff
+        }
+
+    def connect_source(self) -> PollingSocket:
+        socket = PollingSocket()
+        socket.connect()
+
+        for line in ROUTE_DEFINITIONS:
+            socket.emit("linha", line)
+            print(f"[fonte] linha solicitada: {line}")
+
+        return socket
+
+    def run_source_test(self, seconds: int = 120) -> int:
+        self.initialize_routes()
+        socket = self.connect_source()
+        deadline = time.time() + seconds
+        nonempty_events = 0
+
+        while time.time() < deadline:
+            for packet in socket.poll():
+                event = parse_event(packet)
+                if not event:
+                    continue
+
+                name, data = event
+                if name != "posicoes":
+                    continue
+
+                count = len(data) if isinstance(data, list) else 0
+                print(f"[teste] evento posicoes: {count} veículo(s)")
+
+                if count:
+                    nonempty_events += 1
+                    self.process_positions(data)
+
+                if nonempty_events >= 1:
+                    print("[teste] fonte em tempo real funcionando.")
+                    return 0
+
         print(
-            f"[monitor] ativo de {self.config.monitor_start} a {self.config.monitor_end}, "
-            f"fuso {self.config.timezone}, consulta a cada {self.config.poll_seconds}s"
+            "[teste] conexão aceita, mas não houve veículo ativo "
+            "durante o período."
+        )
+        return 0
+
+    def run(
+        self,
+        force_minutes: int | None = None,
+    ) -> None:
+        self.telegram.validate()
+        self.initialize_routes()
+
+        force_deadline = (
+            time.time() + force_minutes * 60
+            if force_minutes
+            else None
         )
 
         while True:
-            now = datetime.now(self.tz)
-            if now.weekday() not in self.config.weekdays:
-                print("[monitor] hoje não está na lista de dias configurados; encerrando.")
+            now = datetime.now(self.timezone)
+
+            if force_deadline and time.time() >= force_deadline:
+                print("[monitor] período manual encerrado.")
                 return
 
-            start = parse_clock(self.config.monitor_start)
-            end = parse_clock(self.config.monitor_end)
-            current = now.time().replace(tzinfo=None)
+            if not force_deadline:
+                if now.weekday() not in self.config.weekdays:
+                    print("[monitor] dia fora da configuração.")
+                    return
 
-            if current < start:
-                wait = min(60, seconds_until(now, start))
-                time.sleep(max(1, wait))
-                continue
-            if current > end:
-                print("[monitor] fim do intervalo; encerrando.")
-                return
+                start = parse_clock(self.config.monitor_start)
+                end = parse_clock(self.config.monitor_end)
+                current = now.time().replace(tzinfo=None)
+
+                if current < start:
+                    print(
+                        f"[monitor] aguardando {self.config.monitor_start}..."
+                    )
+                    time.sleep(min(60, max(
+                        1,
+                        int(
+                            (
+                                now.replace(
+                                    hour=start.hour,
+                                    minute=start.minute,
+                                    second=0,
+                                    microsecond=0,
+                                )
+                                - now
+                            ).total_seconds()
+                        ),
+                    )))
+                    continue
+
+                if current > end:
+                    print("[monitor] fim do intervalo diário.")
+                    return
 
             try:
-                self.cycle()
-            except (requests.RequestException, ValueError, RuntimeError) as exc:
-                print(f"[erro temporário] {exc}", file=sys.stderr)
-            time.sleep(self.config.poll_seconds)
+                socket = self.connect_source()
 
+                while True:
+                    if force_deadline and time.time() >= force_deadline:
+                        return
 
-def display_line(line: str) -> str:
-    return "0.167" if norm_line(line) == "167" else str(line)
+                    now = datetime.now(self.timezone)
+                    if (
+                        not force_deadline
+                        and now.time().replace(tzinfo=None)
+                        > parse_clock(self.config.monitor_end)
+                    ):
+                        print("[monitor] fim do intervalo diário.")
+                        return
 
+                    for packet in socket.poll():
+                        event = parse_event(packet)
+                        if not event:
+                            continue
 
-def parse_clock(value: str) -> dt_time:
-    hour, minute = value.split(":", 1)
-    return dt_time(int(hour), int(minute))
+                        name, data = event
+                        if name == "posicoes":
+                            self.process_positions(data)
 
-
-def seconds_until(now: datetime, target: dt_time) -> int:
-    target_dt = now.replace(
-        hour=target.hour,
-        minute=target.minute,
-        second=0,
-        microsecond=0,
-    )
-    return max(0, int((target_dt - now).total_seconds()))
-
-
-def discover(config: Config) -> None:
-    print("=== DESCOBERTA DA CONFIGURAÇÃO ===")
-    stop, lat, lon, name = discover_stop(config)
-    print(f"\nParada selecionada: {name} ({lat:.6f}, {lon:.6f})")
-    print("Propriedades da parada:")
-    print(json.dumps(stop.get("properties", {}), ensure_ascii=False, indent=2, default=str))
-
-    for layer in (POSITION_LAYER, ROUTE_LAYER):
-        print(f"\nCamada: {layer}")
-        features, field = fetch_features_for_lines(
-            layer,
-            config.lines,
-            all_limit=10_000,
-            debug=True,
-        )
-        print(f"Campo de linha detectado: {field!r}")
-        print(f"Registros encontrados: {len(features)}")
-        if features:
-            sample = features[0]
-            print("Exemplo de propriedades:")
-            print(json.dumps(sample.get("properties", {}), ensure_ascii=False, indent=2, default=str))
+            except (
+                requests.RequestException,
+                RuntimeError,
+                TimeoutError,
+                ValueError,
+            ) as error:
+                print(
+                    f"[fonte] conexão interrompida: {error}. "
+                    f"Nova tentativa em 20 segundos.",
+                    file=sys.stderr,
+                )
+                time.sleep(20)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Monitor de ônibus do DF com Telegram.")
-    parser.add_argument("--config", default="config.json", help="Caminho do config.json")
-    parser.add_argument("--once", action="store_true", help="Executa uma única consulta")
-    parser.add_argument("--discover", action="store_true", help="Mostra campos e parada detectados")
-    parser.add_argument("--test-telegram", action="store_true", help="Envia uma mensagem de teste")
+    parser = argparse.ArgumentParser(
+        description="Monitor das linhas 0.167 e 167.1."
+    )
     parser.add_argument(
-        "--show-updates",
+        "--config",
+        default="config.json",
+        help="Caminho do config.json.",
+    )
+    parser.add_argument(
+        "--test-telegram",
         action="store_true",
-        help="Mostra chat_ids que enviaram mensagens ao bot",
+        help="Envia uma mensagem de teste.",
+    )
+    parser.add_argument(
+        "--test-source",
+        action="store_true",
+        help="Testa itinerários e fonte em tempo real.",
+    )
+    parser.add_argument(
+        "--force-minutes",
+        type=int,
+        help="Executa imediatamente por N minutos.",
     )
     args = parser.parse_args()
 
-    telegram = Telegram()
-
     try:
-        if args.show_updates:
-            telegram.show_updates()
-            return 0
+        config = load_config(args.config)
+        telegram = Telegram()
+
         if args.test_telegram:
             telegram.send(
-                "✅ Teste concluído: o monitor das linhas 0.167 e 167.1 "
-                "consegue enviar mensagens para este Telegram."
+                "✅ Monitor definitivo configurado.\n\n"
+                "Os alertas das linhas 0.167 e 167.1 serão enviados "
+                "para este Telegram."
             )
-            print("Mensagem de teste enviada para todos os chat_ids.")
+            print("Mensagem enviada para todos os destinatários.")
             return 0
 
-        config = load_config(args.config)
-        if args.discover:
-            discover(config)
-            return 0
+        monitor = Monitor(config, telegram)
 
-        Monitor(config, telegram).run(once=args.once)
+        if args.test_source:
+            return monitor.run_source_test()
+
+        monitor.run(force_minutes=args.force_minutes)
         return 0
+
     except KeyboardInterrupt:
-        print("\nEncerrado pelo usuário.")
+        print("\nEncerrado.")
         return 130
-    except Exception as exc:
-        print(f"ERRO: {exc}", file=sys.stderr)
+    except Exception as error:
+        print(f"ERRO: {type(error).__name__}: {error}", file=sys.stderr)
         return 1
 
 

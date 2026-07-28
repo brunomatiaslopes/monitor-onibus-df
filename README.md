@@ -1,125 +1,60 @@
-# Monitor das linhas 0.167 e 167.1
+# Monitor definitivo — linhas 0.167 e 167.1
 
-O programa consulta as camadas públicas da Semob/DF e envia alertas pelo Telegram
-quando um veículo das linhas **0.167** ou **167.1** estiver, aproximadamente, a
-**30 ou 15 minutos** da parada **L2 Sul | SAUS (OAB / Colégio Galois)**.
+O monitor acompanha os ônibus na parada da Via L2 Sul/SAUS, Quadra 5,
+próxima à OAB e ao Galois, no sentido do Guará.
 
-## Antes de subir para o GitHub
+Os dois Telegrams recebem alertas quando a estimativa entra nas faixas de
+aproximadamente 30 e 15 minutos.
 
-O `config.json` contém um intervalo inicial de **16h às 21h, de segunda a sexta**.
-Altere `monitor_start` e `monitor_end` conforme o horário real em que vocês usam o ônibus.
+## Arquivos que devem ficar no repositório
 
-As coordenadas do arquivo são apenas um ponto aproximado. No primeiro teste, execute:
+- `monitor_onibus.py`
+- `config.json`
+- `requirements.txt`
+- `.github/workflows/monitor.yml`
 
-```powershell
-python monitor_onibus.py --discover
+Os arquivos antigos de diagnóstico podem ser apagados depois.
+
+## Secrets necessários
+
+Em `Settings > Secrets and variables > Actions`:
+
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_IDS`
+
+O segundo deve conter os dois IDs separados por vírgula.
+
+## Teste final
+
+Em `Actions > Monitor de ônibus DF > Run workflow`, escolha `testar_fonte`.
+
+O resultado deve mostrar:
+
+- os itinerários das duas linhas;
+- a parada OAB/Galois;
+- conexão com a fonte em tempo real;
+- ao menos um evento de posições, quando houver ônibus ativo.
+
+## Funcionamento automático
+
+O workflow inicia às 15h50, de segunda a sexta-feira, no fuso de Brasília.
+O programa aguarda 16h e funciona até 21h.
+
+Para mudar o intervalo, altere no `config.json`:
+
+```json
+"monitor_start": "16:00",
+"monitor_end": "21:00"
 ```
 
-Confira se o terminal exibe a parada OAB/Galois. Caso escolha outra parada, substitua
-`approximate_lat` e `approximate_lon` pelas coordenadas copiadas do Google Maps.
+## Teste prático
 
-## Teste no Windows
+A opção `monitorar_agora` executa imediatamente por uma hora, sem considerar
+o horário configurado. Ela pode disparar alertas reais se houver ônibus dentro
+das faixas de 30 ou 15 minutos.
 
-1. Instale o Python 3.12.
-2. Abra o PowerShell dentro da pasta do projeto.
-3. Crie e ative o ambiente:
+## Observação
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-4. Defina temporariamente os dados do Telegram:
-
-```powershell
-$env:TELEGRAM_BOT_TOKEN="COLE_AQUI_O_TOKEN"
-$env:TELEGRAM_CHAT_IDS="SEU_CHAT_ID,CHAT_ID_DA_AMIGA"
-```
-
-5. Teste o envio:
-
-```powershell
-python monitor_onibus.py --test-telegram
-```
-
-6. Confira a parada e os campos retornados pela Semob:
-
-```powershell
-python monitor_onibus.py --discover
-```
-
-7. Faça uma consulta sem aguardar o intervalo:
-
-```powershell
-python monitor_onibus.py --once
-```
-
-8. Inicie o monitor normal:
-
-```powershell
-python monitor_onibus.py
-```
-
-Use `Ctrl+C` para interromper.
-
-## Como descobrir o chat_id da amiga sem usar site de terceiros
-
-1. Envie a ela o link do seu bot: `https://t.me/NOME_DO_SEU_BOT`.
-2. Ela deve abrir o link, tocar em **Iniciar** e enviar uma mensagem identificável,
-   por exemplo: `BRUNA ONIBUS 167`.
-3. No seu computador, mantenha apenas o token definido e execute:
-
-```powershell
-$env:TELEGRAM_BOT_TOKEN="COLE_AQUI_O_TOKEN"
-python monitor_onibus.py --show-updates
-```
-
-4. O terminal mostrará o nome, o usuário e o `chat_id` correspondente.
-5. A amiga pode lhe mandar apenas o número do `chat_id`. Ela **não precisa e não deve**
-   receber o token do bot.
-
-Caso não apareça nenhuma conversa, ela deve enviar outra mensagem ao bot e você executa
-o comando novamente.
-
-## Configuração no GitHub
-
-No repositório, abra:
-
-**Settings → Secrets and variables → Actions → New repository secret**
-
-Crie:
-
-- `TELEGRAM_BOT_TOKEN`: token fornecido pelo BotFather;
-- `TELEGRAM_CHAT_IDS`: os dois números separados por vírgula, por exemplo
-  `123456789,987654321`.
-
-Nunca coloque o token ou os chat_ids diretamente no código.
-
-Em seguida, abra **Actions → Monitor de ônibus DF → Run workflow** para fazer um teste
-manual. O arquivo `.github/workflows/monitor.yml` também inicia o monitor às 18:50 UTC,
-de segunda a sexta. Ajuste o `cron` caso altere significativamente o intervalo.
-
-## Como funciona a estimativa
-
-O programa:
-
-- identifica a parada por palavras-chave e proximidade;
-- localiza os veículos das duas linhas;
-- projeta ônibus e parada no itinerário publicado;
-- confirma que o veículo está se aproximando em duas consultas consecutivas;
-- estima o tempo com a distância pelo trajeto, a velocidade observada e um fator de trânsito;
-- evita repetir o mesmo alerta para o mesmo veículo.
-
-A previsão não é garantia de chegada. Trânsito, desvios, ausência de atualização do GPS e
-mudanças no formato do serviço da Semob podem afetar o resultado.
-
-## Comandos úteis
-
-```text
-python monitor_onibus.py --show-updates
-python monitor_onibus.py --test-telegram
-python monitor_onibus.py --discover
-python monitor_onibus.py --once
-python monitor_onibus.py
-```
+A estimativa combina distância pelo itinerário, velocidade recebida, movimento
+observado, quantidade de paradas restantes e fator de trânsito. É aproximada e
+pode variar em razão do tráfego, das paradas e das atualizações do GPS.
