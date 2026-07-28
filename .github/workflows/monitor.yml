@@ -6,16 +6,16 @@ on:
       modo:
         description: "O que deseja executar?"
         required: true
-        default: "testar_telegram"
+        default: "testar_fonte"
         type: choice
         options:
           - testar_telegram
-          - testar_semob
+          - testar_fonte
           - monitorar_agora
 
   schedule:
-    # 18:50 UTC = 15:50 em Brasília
-    - cron: "50 18 * * 1-5"
+    - cron: "50 15 * * 1-5"
+      timezone: "America/Sao_Paulo"
 
 permissions:
   contents: read
@@ -33,7 +33,7 @@ jobs:
       - name: Baixar os arquivos
         uses: actions/checkout@v4
 
-      - name: Preparar o Python
+      - name: Preparar Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -49,15 +49,22 @@ jobs:
           TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
         run: python monitor_onibus.py --test-telegram
 
-      - name: Testar base da Semob
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.modo == 'testar_semob' }}
+      - name: Testar fonte em tempo real
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.modo == 'testar_fonte' }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
-        run: python teste_fonte_tempo_real_v2.py
+        run: python monitor_onibus.py --test-source
 
-      - name: Iniciar monitoramento
-        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.modo == 'monitorar_agora') }}
+      - name: Monitorar agora por uma hora
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.modo == 'monitorar_agora' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+        run: python monitor_onibus.py --force-minutes 60
+
+      - name: Monitoramento diário
+        if: ${{ github.event_name == 'schedule' }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
