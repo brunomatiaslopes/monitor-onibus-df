@@ -841,30 +841,53 @@ class Monitor:
         current_eta: float,
         already_sent: set[int],
     ) -> int | None:
-        candidates = []
+        """
+        Escolhe somente o marco mais próximo do ETA atual.
+
+        Exemplos:
+        - ETA 31 min -> alerta de 30;
+        - ETA 16,8 min -> alerta de 15;
+        - ETA 10 min -> nenhum alerta atrasado.
+        """
+        candidates: list[tuple[float, int]] = []
 
         for threshold in self.config.alerts_minutes:
             if threshold in already_sent:
                 continue
-            if current_eta > threshold:
+
+            # Tolerância proporcional: 4,5 min para o alerta de 30
+            # e 3 min para o alerta de 15.
+            tolerance = max(3.0, threshold * 0.15)
+            difference = abs(current_eta - threshold)
+
+            # Primeira posição observada: envia apenas se o ETA estiver
+            # realmente próximo de um dos marcos.
+            if previous_eta is None:
+                if difference <= tolerance:
+                    candidates.append((difference, threshold))
                 continue
 
-            # Evita enviar o alerta de 30 min quando o ônibus já está,
-            # por exemplo, a apenas 10 min.
-            if current_eta < threshold * 0.52:
-                continue
+            # Posições seguintes: dispara ao atravessar o marco ou quando
+            # estiver dentro da tolerância, sem mandar alerta muito atrasado.
+            crossed = previous_eta > threshold >= current_eta
+            near = difference <= tolerance
+            not_too_late = current_eta >= threshold - tolerance
 
-            if previous_eta is None or previous_eta > threshold:
-                candidates.append(threshold)
+            if (crossed or near) and not_too_late:
+                candidates.append((difference, threshold))
 
         if not candidates:
             return None
 
-        # Se uma atualização pulou vários limites, envia o alerta mais
-        # próximo do ETA atual.
-        return min(candidates)
+        # Escolhe o marco numericamente mais próximo do ETA atual.
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return candidates[0][1]
 
-    def process_vehicle(self, vehicle: dict[str, Any]) -> None:
+    def process_vehicle(
+        self,
+        vehicle: dict[str, Any],
+        allow_alerts: bool = True,
+    ) -> None:
         line = str(vehicle.get("linha") or "")
         route = self.routes.get(line)
         if route is None:
@@ -938,7 +961,7 @@ class Monitor:
                 f"fora_da_rota={offset_m:.0f} m"
             )
 
-        if alert is not None:
+        if alert is not None and allow_alerts:
             rounded_eta = max(1, round(eta_minutes))
             message = (
                 f"🚌 Linha {line} em direção ao Guará\n\n"
@@ -968,7 +991,11 @@ class Monitor:
             last_seen_epoch=time.time(),
         )
 
-    def process_positions(self, data: Any) -> None:
+    def process_positions(
+        self,
+        data: Any,
+        allow_alerts: bool = True,
+    ) -> None:
         if not isinstance(data, list):
             return
 
@@ -979,7 +1006,7 @@ class Monitor:
 
         for vehicle in deduplicate_vehicles(vehicles):
             try:
-                self.process_vehicle(vehicle)
+                self.process_vehicle(vehicle, allow_alerts=allow_alerts)
             except Exception as error:
                 print(
                     f"[aviso] veículo não processado: {error}",
@@ -1024,10 +1051,13 @@ class Monitor:
 
                 if count:
                     nonempty_events += 1
-                    self.process_positions(data)
+                    self.process_positions(data, allow_alerts=False)
 
                 if nonempty_events >= 1:
-                    print("[teste] fonte em tempo real funcionando.")
+                    print(
+                        "[teste] fonte em tempo real funcionando. "
+                        "Nenhum alerta foi enviado no modo de teste."
+                    )
                     return 0
 
         print(
