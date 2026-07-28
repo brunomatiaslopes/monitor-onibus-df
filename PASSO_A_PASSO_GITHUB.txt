@@ -1,0 +1,75 @@
+COLOCAR O MONITOR PARA RODAR NO GITHUB
+
+ANTES:
+O horário atualmente configurado é de 16:00 a 21:00, de segunda a sexta-feira.
+Para alterar, edite monitor_start e monitor_end no arquivo config.json.
+
+1. Entre em github.com e crie um repositório chamado:
+   monitor-onibus-df
+
+2. Deixe o repositório como PUBLIC.
+   Isso evita consumir a franquia mensal de minutos dos repositórios privados.
+   O token e os chat_ids não ficam públicos, pois serão salvos como Secrets.
+
+3. Extraia este ZIP no computador.
+
+4. No repositório, clique em:
+   Add file > Upload files
+
+5. Arraste O CONTEÚDO da pasta extraída para a página.
+   Não envie somente o arquivo ZIP.
+
+6. Confira se apareceram estes arquivos:
+   monitor_onibus.py
+   config.json
+   requirements.txt
+   README.md
+   .github/workflows/monitor.yml
+
+7. Clique em:
+   Commit changes
+
+8. Abra:
+   Settings > Secrets and variables > Actions
+
+9. Clique em:
+   New repository secret
+
+10. Crie o primeiro segredo:
+    Nome: TELEGRAM_BOT_TOKEN
+    Valor: o token fornecido pelo BotFather
+
+11. Crie o segundo segredo:
+    Nome: TELEGRAM_CHAT_IDS
+    Valor: seu chat_id e o da sua amiga, separados por vírgula
+
+    Exemplo:
+    123456789,987654321
+
+12. TESTE O TELEGRAM:
+    Abra Actions > Monitor de ônibus DF > Run workflow
+    Em "O que deseja executar?", escolha:
+    testar_telegram
+    Depois clique no botão verde Run workflow.
+
+13. TESTE A BASE DA SEMOB:
+    Repita o procedimento, mas escolha:
+    testar_semob
+
+    Abra a execução e veja o resultado. Ela deverá localizar:
+    - as linhas 167 e 167.1;
+    - uma parada próxima à OAB/Galois, na L2 Sul.
+
+14. ATIVAÇÃO:
+    Depois que os dois testes passarem, não precisa fazer mais nada.
+    De segunda a sexta-feira, o GitHub iniciará o programa às 15:50.
+    O script aguardará até 16:00 e ficará ativo até 21:00.
+
+15. TESTE FORA DO HORÁRIO:
+    A opção monitorar_agora respeita o intervalo definido no config.json.
+    Para testar imediatamente, altere temporariamente monitor_start e
+    monitor_end para um intervalo que inclua o horário atual.
+
+OBSERVAÇÃO:
+A previsão de 30 e 15 minutos é estimada. Trânsito, desvio de itinerário
+ou falha na atualização do GPS podem afetar o aviso.

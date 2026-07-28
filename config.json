@@ -1,0 +1,39 @@
+{
+  "lines": [
+    "167",
+    "167.1"
+  ],
+  "stop": {
+    "keywords": [
+      "OAB",
+      "GALOIS",
+      "SAUS",
+      "QUADRA 5"
+    ],
+    "approximate_lat": -15.7992,
+    "approximate_lon": -47.8732,
+    "search_radius_m": 3000
+  },
+  "alerts_minutes": [
+    30,
+    15
+  ],
+  "monitor_start": "16:00",
+  "monitor_end": "21:00",
+  "weekdays": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "poll_seconds": 60,
+  "timezone": "America/Sao_Paulo",
+  "default_speed_kmh": 25,
+  "traffic_factor": 1.15,
+  "straight_line_factor": 1.35,
+  "minimum_movement_m": 35,
+  "stop_passed_radius_m": 120,
+  "max_vehicle_age_minutes": 15,
+  "debug": false
+}
