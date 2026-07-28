@@ -1,0 +1,64 @@
+name: Monitor de ônibus DF
+
+on:
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: "O que deseja executar?"
+        required: true
+        default: "testar_telegram"
+        type: choice
+        options:
+          - testar_telegram
+          - testar_semob
+          - monitorar_agora
+
+  schedule:
+    # 18:50 UTC = 15:50 em Brasília
+    - cron: "50 18 * * 1-5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monitor-onibus-df
+  cancel-in-progress: true
+
+jobs:
+  executar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Baixar os arquivos
+        uses: actions/checkout@v4
+
+      - name: Preparar o Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Testar Telegram
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.modo == 'testar_telegram' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+        run: python monitor_onibus.py --test-telegram
+
+      - name: Testar base da Semob
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.modo == 'testar_semob' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+        run: python monitor_onibus.py --discover
+
+      - name: Iniciar monitoramento
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.modo == 'monitorar_agora') }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
+        run: python monitor_onibus.py
