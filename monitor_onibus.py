@@ -27,6 +27,8 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 WFS_URL = "https://geoserver.semob.df.gov.br/geoserver/semob/ows"
@@ -35,8 +37,38 @@ POSITION_LAYER = "semob:ultima_posicao"
 STOP_LAYER = "semob:ponto_parada_v2025"
 ROUTE_LAYER = "semob:itinerario_espacial"
 
-REQUEST_TIMEOUT = 30
+REQUEST_CONNECT_TIMEOUT = 15
+REQUEST_READ_TIMEOUT = 90
 EARTH_RADIUS_M = 6_371_000.0
+
+
+def build_http_session() -> requests.Session:
+    retry = Retry(
+        total=4,
+        connect=4,
+        read=3,
+        status=3,
+        backoff_factor=3,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
+        raise_on_status=False,
+    )
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": (
+                "monitor-onibus-df/1.1 "
+                "(consulta de dados publicos da Semob-DF)"
+            ),
+            "Accept": "application/json,text/plain,*/*",
+        }
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount("http://", HTTPAdapter(max_retries=retry))
+    return session
+
+
+HTTP = build_http_session()
 
 LINE_ALIASES = (
     "linha", "numero_linha", "num_linha", "nr_linha", "codigo_linha",
@@ -177,6 +209,7 @@ def wfs_get(
     *,
     max_features: int,
     cql_filter: str | None = None,
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> dict[str, Any]:
     params = {
         "service": "WFS",
@@ -189,10 +222,34 @@ def wfs_get(
     }
     if cql_filter:
         params["CQL_FILTER"] = cql_filter
+    if bbox:
+        min_lon, min_lat, max_lon, max_lat = bbox
+        params["BBOX"] = (
+            f"{min_lon:.7f},{min_lat:.7f},"
+            f"{max_lon:.7f},{max_lat:.7f},EPSG:4326"
+        )
 
-    response = requests.get(WFS_URL, params=params, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    data = response.json()
+    try:
+        response = HTTP.get(
+            WFS_URL,
+            params=params,
+            timeout=(REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT),
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"A Semob não respondeu à consulta da camada {layer}. "
+            f"Tentativas automáticas esgotadas: {exc}"
+        ) from exc
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        trecho = response.text[:300].replace("\n", " ")
+        raise RuntimeError(
+            f"A Semob devolveu uma resposta que não é JSON para {layer}: {trecho}"
+        ) from exc
+
     if not isinstance(data, dict) or "features" not in data:
         raise RuntimeError(f"Resposta inesperada da camada {layer}.")
     return data
@@ -298,7 +355,24 @@ def all_text(properties: dict[str, Any]) -> str:
 
 
 def discover_stop(config: Config) -> tuple[dict[str, Any], float, float, str]:
-    features = wfs_get(STOP_LAYER, max_features=30_000).get("features", [])
+    # Em vez de baixar todas as paradas do DF, consulta apenas a região da OAB.
+    lat_delta = config.stop_search_radius_m / 111_320.0
+    lon_scale = max(0.2, math.cos(math.radians(config.stop_center_lat)))
+    lon_delta = config.stop_search_radius_m / (111_320.0 * lon_scale)
+
+    bbox = (
+        config.stop_center_lon - lon_delta,
+        config.stop_center_lat - lat_delta,
+        config.stop_center_lon + lon_delta,
+        config.stop_center_lat + lat_delta,
+    )
+
+    features = wfs_get(
+        STOP_LAYER,
+        max_features=1_000,
+        bbox=bbox,
+    ).get("features", [])
+
     wanted = [norm_text(v).replace("_", " ") for v in config.stop_keywords]
 
     candidates: list[tuple[int, float, dict[str, Any], float, float, str]] = []
@@ -307,7 +381,12 @@ def discover_stop(config: Config) -> tuple[dict[str, Any], float, float, str]:
         if not point:
             continue
         lat, lon = point
-        distance = haversine_m(config.stop_center_lat, config.stop_center_lon, lat, lon)
+        distance = haversine_m(
+            config.stop_center_lat,
+            config.stop_center_lon,
+            lat,
+            lon,
+        )
         if distance > config.stop_search_radius_m:
             continue
 
@@ -320,29 +399,34 @@ def discover_stop(config: Config) -> tuple[dict[str, Any], float, float, str]:
                 str(v) for v in props.values()
                 if isinstance(v, str) and len(v.strip()) >= 5
             ]
-            name = " | ".join(meaningful[:3]) if meaningful else str(feature.get("id", "parada"))
+            name = (
+                " | ".join(meaningful[:3])
+                if meaningful
+                else str(feature.get("id", "parada"))
+            )
         candidates.append((matches, distance, feature, lat, lon, str(name)))
 
     if not candidates:
         raise RuntimeError(
-            "Não encontrei paradas próximas das coordenadas aproximadas. "
-            "Ajuste approximate_lat/approximate_lon no config.json."
+            "A Semob respondeu, mas nenhuma parada foi encontrada perto das "
+            "coordenadas configuradas. Ajuste approximate_lat/approximate_lon "
+            "no config.json."
         )
 
-    # Prioriza a descrição OAB/Galois/SAUS e, depois, a distância ao ponto aproximado.
     candidates.sort(key=lambda item: (-item[0], item[1]))
     matches, distance, feature, lat, lon, name = candidates[0]
 
     if matches == 0:
         print(
-            "[aviso] Nenhuma descrição da parada coincidiu com as palavras-chave; "
-            "foi escolhida a parada mais próxima das coordenadas aproximadas."
+            "[aviso] Nenhuma descrição coincidiu com as palavras-chave; "
+            "foi escolhida a parada mais próxima das coordenadas."
         )
 
     print(
         f"[parada] {name}\n"
         f"         latitude={lat:.6f}, longitude={lon:.6f}, "
-        f"distância do ponto aproximado={distance:.0f} m, palavras coincidentes={matches}"
+        f"distância do ponto aproximado={distance:.0f} m, "
+        f"palavras coincidentes={matches}"
     )
     return feature, lat, lon, name
 
@@ -538,7 +622,7 @@ class Telegram:
                         "text": text,
                         "disable_web_page_preview": True,
                     },
-                    timeout=REQUEST_TIMEOUT,
+                    timeout=(REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT),
                 )
                 response.raise_for_status()
                 payload = response.json()
