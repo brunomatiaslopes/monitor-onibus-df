@@ -13,8 +13,9 @@ on:
           - testar_fonte
           - monitorar_agora
 
+  # O workflow começa 15 minutos antes e o programa aguarda até 16h30.
   schedule:
-    - cron: "50 15 * * 1-5"
+    - cron: "15 16 * * 1-5"
       timezone: "America/Sao_Paulo"
 
 permissions:
@@ -27,14 +28,14 @@ concurrency:
 jobs:
   executar:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 210
 
     steps:
       - name: Baixar os arquivos
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Preparar Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -63,7 +64,7 @@ jobs:
           TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
         run: python monitor_onibus.py --force-minutes 60
 
-      - name: Monitoramento diário
+      - name: Monitoramento automático das 16h30 às 19h
         if: ${{ github.event_name == 'schedule' }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
